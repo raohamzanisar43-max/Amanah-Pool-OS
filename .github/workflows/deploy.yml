@@ -1,0 +1,72 @@
+name: Deploy
+
+# After CI passes on master/main, ship to https://pool.novulabs.net. Can also be run by hand.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to production
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://pool.novulabs.net
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Sync code to server
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          rsync -az --delete -e "ssh -i ~/.ssh/id_deploy" \
+            --exclude '.git' --exclude '.github' --exclude 'node_modules' --exclude 'venv' \
+            --exclude '.env' --exclude 'backend/data' --exclude 'backend/logs' \
+            --exclude 'audit_reports*' --exclude 'docs' \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:/opt/pool/"
+
+      - name: Build and restart
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -i ~/.ssh/id_deploy "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -e
+            cd /opt/pool/deploy
+            docker compose -f docker-compose.server.yml up -d --build --remove-orphans
+            docker image prune -f >/dev/null
+          '
+
+      - name: Verify
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' https://pool.novulabs.net/api/v1/health/ || true)
+            if [ "$code" = "200" ]; then echo "API healthy"; break; fi
+            echo "attempt $i: HTTP $code"; sleep 8
+            if [ "$i" = 30 ]; then echo "Health check failed"; exit 1; fi
+          done
+          curl -fsS -o /dev/null https://pool.novulabs.net/
